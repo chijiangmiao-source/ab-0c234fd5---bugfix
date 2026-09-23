@@ -54,12 +54,6 @@ interface Layer {
   variation: Int32Array;
 }
 
-interface PrefixLayer {
-  error: Float64Array;
-  variation: Int32Array;
-  shift: Int16Array;
-}
-
 export function solve(raw: SolverInput): SolveResult {
   const validationError = validateInput(raw);
   const base: SolveResult = {
@@ -126,29 +120,24 @@ export function solve(raw: SolverInput): SolveResult {
     variation: new Int32Array(n * m).fill(-1),
   });
 
-  const newPrefixLayer = (): PrefixLayer => ({
-    error: new Float64Array(n).fill(Infinity),
-    variation: new Int32Array(n).fill(-1),
-    shift: new Int16Array(n).fill(D + 1),
-  });
-
-  // ---------- 前向 DP：F[i][p][c] ----------
-  const forward: PrefixLayer[] = [];
+  // ---------- 前向 DP：F[i][p][c]，每个 (结束下标, 补偿) 状态独立保留 ----------
+  // 不能按结束下标只保留一个“最优补偿”：同一 p 下次优的 (误差,变化量) 可能借后续段
+  // 走出严格更优的全局路径（前驱可行集也随补偿不同），故必须对全部 c 展开。
+  const forward: Layer[] = [];
   {
-    const layer = newPrefixLayer();
+    const layer = newLayer();
     const ci0 = ciOf(0);
     const lastP = Math.min(U - 1, n - 1);
     for (let p = L - 1; p <= lastP; p++) {
-      layer.error[p] = segCost(0, ci0, 0, p);
-      layer.variation[p] = 0;
-      layer.shift[p] = 0;
+      layer.error[idx(p, ci0)] = segCost(0, ci0, 0, p);
+      layer.variation[idx(p, ci0)] = 0;
     }
     forward.push(layer);
   }
 
   for (let i = 1; i < k; i++) {
     const prev = forward[i - 1];
-    const cur = newPrefixLayer();
+    const cur = newLayer();
     let layerReachable = false;
 
     for (let ci = 0; ci < m; ci++) {
@@ -163,12 +152,9 @@ export function solve(raw: SolverInput): SolveResult {
         const qAdd = p - L; // 本轮新进入窗口的前驱结束位置
         if (qAdd >= 0) {
           for (const [cj, dq] of queues) {
-            if (prev.shift[qAdd] === shiftOf(cj) && Number.isFinite(prev.error[qAdd])) {
-              dq.push(
-                qAdd,
-                prev.error[qAdd] - P[i][ci][qAdd + 1],
-                prev.variation[qAdd],
-              );
+            const pi = idx(qAdd, cj);
+            if (Number.isFinite(prev.error[pi])) {
+              dq.push(qAdd, prev.error[pi] - P[i][ci][qAdd + 1], prev.variation[pi]);
             }
           }
         }
@@ -176,17 +162,12 @@ export function solve(raw: SolverInput): SolveResult {
         for (const [cj, dq] of queues) {
           dq.evictBefore(qMin);
           if (dq.empty) continue;
+          const oi = idx(p, ci);
           const candE = dq.frontError + P[i][ci][p + 1];
           const candV = dq.frontVariation + Math.abs(c - shiftOf(cj));
-          if (
-            candE < cur.error[p] ||
-            (candE === cur.error[p] &&
-              (candV < cur.variation[p] ||
-                (candV === cur.variation[p] && c < cur.shift[p])))
-          ) {
-            cur.error[p] = candE;
-            cur.variation[p] = candV;
-            cur.shift[p] = c;
+          if (candE < cur.error[oi] || (candE === cur.error[oi] && candV < cur.variation[oi])) {
+            cur.error[oi] = candE;
+            cur.variation[oi] = candV;
             layerReachable = true;
           }
         }
@@ -207,13 +188,28 @@ export function solve(raw: SolverInput): SolveResult {
   }
 
   // ---------- 全局两级最优（末段必须结束于 n-1） ----------
-  const bestError = forward[k - 1].error[n - 1];
-  const bestVariation = forward[k - 1].variation[n - 1];
+  let bestError = Infinity;
+  for (let ci = 0; ci < m; ci++) {
+    const e = forward[k - 1].error[idx(n - 1, ci)];
+    if (e < bestError) bestError = e;
+  }
+  let bestVariation = Infinity;
+  for (let ci = 0; ci < m; ci++) {
+    const oi = idx(n - 1, ci);
+    if (forward[k - 1].error[oi] === bestError) {
+      bestVariation = Math.min(bestVariation, forward[k - 1].variation[oi]);
+    }
+  }
   if (!Number.isFinite(bestError)) {
     const reachableEnds: number[] = [];
     const last = forward[k - 1];
     for (let p = 0; p < n; p++) {
-      if (Number.isFinite(last.error[p])) reachableEnds.push(p);
+      for (let ci = 0; ci < m; ci++) {
+        if (Number.isFinite(last.error[idx(p, ci)])) {
+          reachableEnds.push(p);
+          break;
+        }
+      }
     }
     return {
       ...base,
@@ -292,12 +288,14 @@ export function solve(raw: SolverInput): SolveResult {
     const shifts = new Set<number>();
     for (let p = 0; p < n; p++) {
       for (let ci = 0; ci < m; ci++) {
-        if (forward[i].shift[p] !== shiftOf(ci)) continue;
-        const fe = forward[i].error[p];
+        const fi = idx(p, ci);
+        const fe = forward[i].error[fi];
         if (!Number.isFinite(fe)) continue;
-        const be = backward[i].error[idx(p, ci)];
+        const fv = forward[i].variation[fi];
+        const bi = idx(p, ci);
+        const be = backward[i].error[bi];
         if (!Number.isFinite(be)) continue;
-        if (onOptimal(fe + be, forward[i].variation[p] + backward[i].variation[idx(p, ci)])) {
+        if (onOptimal(fe + be, fv + backward[i].variation[bi])) {
           const c = shiftOf(ci);
           states.add(stateKey(p, c));
           ends.add(p);

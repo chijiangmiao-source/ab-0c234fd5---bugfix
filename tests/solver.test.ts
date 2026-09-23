@@ -280,6 +280,160 @@ describe('求解器与暴力参照一致', () => {
   });
 });
 
+describe('复核页审计用例：全局校准路径与两级同优可达集合', () => {
+  // 十个电流样本：前两个 0，接着两个 1，余下六个 -2；五个符号目标电平均为 0；
+  // L=U=2（各段结束下标因此固定为 1,3,5,7,9），D=2。
+  const auditSamples = [0, 0, 1, 1, -2, -2, -2, -2, -2, -2];
+  const auditTargets = [0, 0, 0, 0, 0];
+  const auditInput: SolverInput = {
+    samples: auditSamples,
+    symbols: ['A', 'B', 'C', 'D', 'E'],
+    targets: auditTargets,
+    minDwell: 2,
+    maxDwell: 2,
+    maxShift: 2,
+  };
+
+  /** 按给定分段与补偿逐样本复算 |sample - (target+补偿)| */
+  function perSampleErrors(samples: number[], targets: number[], ends: number[], shifts: number[]) {
+    const errs = new Array<number>(samples.length).fill(0);
+    let start = 0;
+    ends.forEach((end, i) => {
+      for (let x = start; x <= end; x++) {
+        errs[x] = Math.abs(samples[x] - (targets[i] + shifts[i]));
+      }
+      start = end + 1;
+    });
+    return errs;
+  }
+
+  it('两级最优值为 E*=4、V*=2，规范补偿为 0,-1,-2,-2,-2', () => {
+    const res = solve(auditInput);
+    expect(res.feasible).toBe(true);
+    if (!res.feasible) throw new Error('应当有解');
+
+    expect(res.bestError).toBe(4);
+    expect(res.bestVariation).toBe(2);
+    expect(res.ends).toEqual([1, 3, 5, 7, 9]);
+    expect(res.lengths).toEqual([2, 2, 2, 2, 2]);
+    expect(res.shifts).toEqual([0, -1, -2, -2, -2]);
+    expect(res.canonicalVector).toEqual([1, 0, 3, -1, 5, -2, 7, -2, 9, -2]);
+
+    // 约束自洽：首补偿为 0、|c|≤D、相邻差 ≤1、驻留长度合法
+    expect(res.shifts![0]).toBe(0);
+    for (let i = 0; i < res.k; i++) {
+      expect(Math.abs(res.shifts![i])).toBeLessThanOrEqual(2);
+      expect(res.lengths![i]).toBeGreaterThanOrEqual(2);
+      expect(res.lengths![i]).toBeLessThanOrEqual(2);
+      if (i > 0) {
+        expect(Math.abs(res.shifts![i] - res.shifts![i - 1])).toBeLessThanOrEqual(1);
+      }
+    }
+
+    // 逐样本误差复算：仅第 2 段（样本 2、3，生效电平 -1）各贡献 2，合计 4
+    const errs = perSampleErrors(auditSamples, auditTargets, res.ends!, res.shifts!);
+    expect(errs).toEqual([0, 0, 2, 2, 0, 0, 0, 0, 0, 0]);
+    expect(errs.reduce((a, b) => a + b, 0)).toBe(4);
+    expect(errs.reduce((a, b) => a + b, 0)).toBe(res.bestError);
+  });
+
+  it('两级同优方案恰有两种：第二段 -1/0、第三段 -2/-1，联合可达状态完整', () => {
+    const res = solve(auditInput);
+    const ref = bruteForce(auditInput);
+    expect(res.feasible).toBe(true);
+    if (!res.feasible || !ref.feasible) throw new Error('应当有解');
+
+    // 与暴力枚举逐项对齐
+    expect(ref.bestError).toBe(4);
+    expect(ref.bestVariation).toBe(2);
+    expect(ref.optimalCount).toBe(2);
+    const refShiftPlans = ref.optimal.map((p) => p.shifts).sort((a, b) => a.join(',') < b.join(',') ? -1 : 1);
+    expect(refShiftPlans).toEqual([
+      [0, -1, -2, -2, -2],
+      [0, 0, -1, -2, -2],
+    ]);
+    expect(res.canonicalVector).toEqual(ref.canonical.vector);
+
+    // 结束下标由 L=U=2 唯一固定；补偿歧义只出现在第 2、3 段
+    expect(res.reachableEnds).toEqual([[1], [3], [5], [7], [9]]);
+    expect(res.reachableShifts).toEqual([[0], [-1, 0], [-2, -1], [-2], [-2]]);
+
+    const sortStates = (set: Set<string>) =>
+      [...set].sort((a, b) => {
+        const [pa, ca] = a.split('#').map(Number);
+        const [pb, cb] = b.split('#').map(Number);
+        return pa - pb || ca - cb;
+      });
+
+    const stateSets = res.reachableStates!.map(sortStates);
+    expect(stateSets).toEqual([
+      ['1#0'],
+      ['3#-1', '3#0'],
+      ['5#-2', '5#-1'],
+      ['7#-2'],
+      ['9#-2'],
+    ]);
+
+    // 暴力最优方案中出现的每个状态都必须在联合可达集合内，反之亦然
+    for (let i = 0; i < 5; i++) {
+      const expected = new Set(ref.optimal.map((p) => `${p.ends[i]}#${p.shifts[i]}`));
+      expect([...res.reachableStates![i]].sort()).toEqual([...expected].sort());
+    }
+    expect(res.reachableBoundaries).toEqual([1, 3, 5, 7]);
+  });
+
+  it('电流整体镜像（样本取反）：同样 E*=4、V*=2，歧义集合翻为正补偿', () => {
+    const mirror: SolverInput = {
+      ...auditInput,
+      // -0 与 0 数值相同，但显式归一再断言（Object.is 区分 ±0）
+      samples: auditSamples.map((v) => (v === 0 ? 0 : -v)),
+    };
+    expect(mirror.samples).toEqual([0, 0, -1, -1, 2, 2, 2, 2, 2, 2]);
+
+    const res = solve(mirror);
+    const ref = bruteForce(mirror);
+    expect(res.feasible).toBe(true);
+    if (!res.feasible || !ref.feasible) throw new Error('应当有解');
+
+    expect(res.bestError).toBe(4);
+    expect(res.bestVariation).toBe(2);
+    expect(ref.optimalCount).toBe(2);
+
+    // 字典序最小规范路径：第二段取较小的 0（镜像后正补偿歧义在另一条同优方案中）
+    expect(res.ends).toEqual([1, 3, 5, 7, 9]);
+    expect(res.shifts).toEqual([0, 0, 1, 2, 2]);
+    expect(res.canonicalVector).toEqual([1, 0, 3, 0, 5, 1, 7, 2, 9, 2]);
+    expect(res.canonicalVector).toEqual(ref.canonical.vector);
+
+    // 正补偿歧义集合：第二段 0/1、第三段 1/2，首段与末两段固定
+    const refShiftPlans = ref.optimal.map((p) => p.shifts).sort((a, b) => a.join(',') < b.join(',') ? -1 : 1);
+    expect(refShiftPlans).toEqual([
+      [0, 0, 1, 2, 2],
+      [0, 1, 2, 2, 2],
+    ]);
+    expect(res.reachableShifts).toEqual([[0], [0, 1], [1, 2], [2], [2]]);
+    const mirrorStateSets = res.reachableStates!.map((s) =>
+      [...s].sort((a, b) => {
+        const [pa, ca] = a.split('#').map(Number);
+        const [pb, cb] = b.split('#').map(Number);
+        return pa - pb || ca - cb;
+      }),
+    );
+    expect(mirrorStateSets).toEqual([
+      ['1#0'],
+      ['3#0', '3#1'],
+      ['5#1', '5#2'],
+      ['7#2'],
+      ['9#2'],
+    ]);
+
+    // 逐样本误差复算：第 2、3 段四个样本各贡献 1，合计 4
+    const errs = perSampleErrors(mirror.samples, auditTargets, res.ends!, res.shifts!);
+    expect(errs).toEqual([0, 0, 1, 1, 1, 1, 0, 0, 0, 0]);
+    expect(errs.reduce((a, b) => a + b, 0)).toBe(4);
+  });
+});
+
 describe('输入校验与首因定位', () => {
   const valid: SolverInput = {
     samples: [0, 1, 2, 3, 4, 5],
